@@ -384,7 +384,7 @@ function GenerateStep() {
   return (
     <StepFrame
       title="Ready to generate the week?"
-      subtitle="MealFlow AI will assemble a 7-day plan from the demo catalog, then you can optimize cost and open the grocery list."
+      subtitle="Nourivoo AI will assemble a 7-day plan from the demo catalog, then you can optimize cost and open the grocery list."
       footer={
         <>
           <Button variant="ghost" onClick={goBack} disabled={generating}>

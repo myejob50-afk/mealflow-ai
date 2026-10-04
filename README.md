@@ -1,4 +1,4 @@
-# MealFlow AI
+# Nourivoo AI
 
 English-first weekly family meal planner. Turn budget, household size, meals per day, diet, allergies, exclusions, cook time, and pantry items into a 7-day plan and a grouped grocery list.
 

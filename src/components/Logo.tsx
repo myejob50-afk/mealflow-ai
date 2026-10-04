@@ -16,10 +16,10 @@ export function Logo({ compact = false }: { compact?: boolean }) {
       {!compact && (
         <span className="leading-tight">
           <span className="block font-display text-lg font-semibold tracking-tight text-ink">
-            MealFlow AI
+            Nourivoo AI
           </span>
           <span className="block text-[11px] font-medium uppercase tracking-[0.16em] text-ink-soft">
-            Family meal planning
+            SMART FAMILY MEAL PLANNING
           </span>
         </span>
       )}
