@@ -940,113 +940,381 @@ function withRecipeAt(meals: PlannedMeal[], index: number, recipe: Recipe, peopl
   )
 }
 
+type CostSearchLimit = { maxUses: number; minUnique: number }
+
+const OPTIMIZE_EVAL_LIMIT = 24000
+const OPTIMIZE_SWAP_PASSES = 36
+const OPTIMIZE_PAIR_PASSES = 8
+
+function spendEval(counter: { n: number }): boolean {
+  counter.n += 1
+  return counter.n > OPTIMIZE_EVAL_LIMIT
+}
+
+function minimumUsesNeeded(prefs: PlannerPrefs): number {
+  const slots = slotsForMealsPerDay(prefs.mealsPerDay)
+  return slots.reduce((highest, slot) => {
+    const poolSize = compatiblePool(prefs, slot).length
+    if (poolSize === 0) return Math.max(highest, 7)
+    return Math.max(highest, Math.ceil(7 / poolSize))
+  }, 1)
+}
+
+function varietySteps(prefs: PlannerPrefs, mealCount: number): CostSearchLimit[] {
+  const possible = Math.min(maxPossibleUnique(prefs), mealCount)
+  const needed = minimumUsesNeeded(prefs)
+  // Stay at the product variety bar: 18 different recipes when the catalog allows it,
+  // and never more than two uses unless a slot has too few recipes to fill the week.
+  return [{ maxUses: Math.max(2, needed), minUnique: Math.min(possible, 18) }]
+}
+
+function varietyOk(meals: PlannedMeal[], prefs: PlannerPrefs, step: CostSearchLimit): boolean {
+  const slots = slotsForMealsPerDay(prefs.mealsPerDay)
+  if (consecutiveRepeatCount(meals) > 0) {
+    if (!slots.every((slot) => compatiblePool(prefs, slot).length <= 1)) return false
+  }
+  for (const meal of meals) {
+    if (!isRecipeCompatible(getRecipe(meal.recipeId), prefs)) return false
+  }
+  const counts = new Map<string, number>()
+  for (const meal of meals) counts.set(meal.recipeId, (counts.get(meal.recipeId) ?? 0) + 1)
+  for (const count of counts.values()) {
+    if (count > step.maxUses) return false
+  }
+  const possible = Math.min(maxPossibleUnique(prefs), meals.length)
+  if (counts.size < Math.min(step.minUnique, possible)) return false
+  for (const slot of slots) {
+    const poolSize = compatiblePool(prefs, slot).length
+    if (slotDistinctCount(meals, slot) < Math.min(2, poolSize)) return false
+  }
+  return true
+}
+
+const marginalShopCache = new Map<string, number>()
+
+function marginalShopCost(recipe: Recipe, prefs: PlannerPrefs): number {
+  const key = `${recipe.id}|${prefs.people}|${JSON.stringify(prefs.pantry)}`
+  const cached = marginalShopCache.get(key)
+  if (cached != null) return cached
+  const cost = shoppingCost(
+    [makeMeal({ date: '2000-01-01', dayLabel: 't' }, recipe.slot, recipe, prefs.people)],
+    prefs,
+  )
+  marginalShopCache.set(key, cost)
+  return cost
+}
+
+function rankByShopCost(pool: Recipe[], prefs: PlannerPrefs): Recipe[] {
+  return [...pool].sort((a, b) => {
+    const cost = marginalShopCost(a, prefs) - marginalShopCost(b, prefs)
+    if (Math.abs(cost) > 0.01) return cost
+    return recipeCost(a, prefs.people) - recipeCost(b, prefs.people)
+  })
+}
+
+function setsForSlot(ranked: Recipe[], days: number, maxUses: number): Recipe[][] {
+  const minUnique = Math.max(1, Math.ceil(days / Math.max(1, maxUses)))
+  const maxUnique = Math.min(days, ranked.length)
+  const sets: Recipe[][] = []
+  const seen = new Set<string>()
+  const add = (recipes: Recipe[]) => {
+    if (recipes.length < minUnique || recipes.length > maxUnique) return
+    const key = [...recipes].map((recipe) => recipe.id).sort().join('|')
+    if (seen.has(key)) return
+    seen.add(key)
+    sets.push(recipes)
+  }
+  for (let unique = maxUnique; unique >= minUnique; unique -= 1) {
+    const base = ranked.slice(0, unique)
+    add(base)
+    for (let offset = 0; offset < 2; offset += 1) {
+      const replacement = ranked[unique + offset]
+      if (!replacement || unique === 0) break
+      add([...base.slice(0, -1), replacement])
+    }
+  }
+  return sets
+}
+
+function placeWithoutConsecutive(
+  recipes: Recipe[],
+  days: number,
+  maxUses: number,
+  prefs: PlannerPrefs,
+): Recipe[] | null {
+  if (recipes.length === 0 || recipes.length > days || recipes.length * maxUses < days) return null
+  const ranked = rankByShopCost(recipes, prefs)
+  const left = new Map<string, number>()
+  for (const recipe of recipes) left.set(recipe.id, 1)
+  let extra = days - recipes.length
+  for (const recipe of ranked) {
+    if (extra <= 0) break
+    const add = Math.min(maxUses - 1, extra)
+    left.set(recipe.id, 1 + add)
+    extra -= add
+  }
+  if (extra > 0) return null
+  const order: Recipe[] = []
+  for (let day = 0; day < days; day += 1) {
+    const previousId = order[day - 1]?.id
+    const options = recipes.filter((recipe) => (left.get(recipe.id) ?? 0) > 0 && recipe.id !== previousId)
+    if (options.length === 0) return null
+    options.sort((a, b) => {
+      const remain = (left.get(b.id) ?? 0) - (left.get(a.id) ?? 0)
+      if (remain !== 0) return remain
+      return marginalShopCost(a, prefs) - marginalShopCost(b, prefs)
+    })
+    const pick = options[0]
+    left.set(pick.id, (left.get(pick.id) ?? 1) - 1)
+    order.push(pick)
+  }
+  return order
+}
+
+function applySlotSets(
+  skeleton: PlannedMeal[],
+  prefs: PlannerPrefs,
+  slots: MealSlot[],
+  sets: Recipe[][],
+  maxUses: number,
+): PlannedMeal[] | null {
+  const meals = skeleton.map((meal) => ({ ...meal }))
+  for (let index = 0; index < slots.length; index += 1) {
+    const slot = slots[index]
+    const indices = meals
+      .map((meal, mealIndex) => ({ meal, mealIndex }))
+      .filter(({ meal }) => meal.slot === slot)
+      .sort((a, b) => a.meal.date.localeCompare(b.meal.date))
+    const order = placeWithoutConsecutive(sets[index], indices.length, maxUses, prefs)
+    if (!order || order.length !== indices.length) return null
+    indices.forEach(({ mealIndex }, day) => {
+      const recipe = order[day]
+      meals[mealIndex] = {
+        ...meals[mealIndex],
+        recipeId: recipe.id,
+        estimatedCost: recipeCost(recipe, prefs.people),
+      }
+    })
+  }
+  return meals
+}
+
+function buildLowCostWeek(
+  skeleton: PlannedMeal[],
+  prefs: PlannerPrefs,
+  step: CostSearchLimit,
+  counter: { n: number },
+): PlannedMeal[] | null {
+  const slots = slotsForMealsPerDay(prefs.mealsPerDay)
+  const uniqueTarget = Math.min(step.minUnique, maxPossibleUnique(prefs), skeleton.length)
+  const slotSets = slots.map((slot) => {
+    const days = skeleton.filter((meal) => meal.slot === slot).length
+    return setsForSlot(rankByShopCost(compatiblePool(prefs, slot), prefs), days, step.maxUses)
+  })
+  if (slotSets.some((sets) => sets.length === 0)) return null
+
+  let best: PlannedMeal[] | null = null
+  let bestCost = Number.POSITIVE_INFINITY
+  let bestShare = -1
+
+  const walk = (chosen: Recipe[][]) => {
+    if (spendEval(counter)) return
+    if (chosen.length === slots.length) {
+      const unique = chosen.reduce((sum, set) => sum + set.length, 0)
+      if (unique < uniqueTarget) return
+      const meals = applySlotSets(skeleton, prefs, slots, chosen, step.maxUses)
+      if (!meals || !varietyOk(meals, prefs, step)) return
+      const cost = shoppingCost(meals, prefs)
+      const share = meals.reduce(
+        (sum, meal, index) => sum + weekOverlap(meals, index, getRecipe(meal.recipeId)),
+        0,
+      )
+      if (cost < bestCost - 0.01 || (Math.abs(cost - bestCost) <= 0.01 && share > bestShare)) {
+        best = meals
+        bestCost = cost
+        bestShare = share
+      }
+      return
+    }
+    const slotIndex = chosen.length
+    const usedUnique = chosen.reduce((sum, set) => sum + set.length, 0)
+    for (const set of slotSets[slotIndex]) {
+      const maxAhead = slotSets
+        .slice(slotIndex + 1)
+        .reduce((sum, sets) => sum + sets.reduce((highest, item) => Math.max(highest, item.length), 0), 0)
+      if (usedUnique + set.length + maxAhead < uniqueTarget) continue
+      if (counter.n > OPTIMIZE_EVAL_LIMIT) return
+      walk([...chosen, set])
+    }
+  }
+
+  walk([])
+  return best
+}
+
+function mealShare(meals: PlannedMeal[], index: number, recipe: Recipe): number {
+  return weekOverlap(meals, index, recipe)
+}
+
+function improveBySwaps(
+  start: PlannedMeal[],
+  prefs: PlannerPrefs,
+  step: CostSearchLimit,
+  counter: { n: number },
+): PlannedMeal[] {
+  let current = start.map((meal) => ({ ...meal }))
+  if (!varietyOk(current, prefs, step)) return current
+
+  for (let pass = 0; pass < OPTIMIZE_SWAP_PASSES; pass += 1) {
+    if (counter.n > OPTIMIZE_EVAL_LIMIT) break
+    const currentCost = shoppingCost(current, prefs)
+    if (currentCost <= prefs.budget) break
+    let best: { index: number; recipe: Recipe; cost: number; share: number } | null = null
+    for (let index = 0; index < current.length; index += 1) {
+      const pool = compatiblePool(prefs, current[index].slot)
+      for (const candidate of pool) {
+        if (candidate.id === current[index].recipeId) continue
+        if (spendEval(counter)) return current
+        if (usageAfterSwap(current, index, candidate.id) > step.maxUses) continue
+        if (
+          (neighborId(current, index, -1) === candidate.id || neighborId(current, index, 1) === candidate.id) &&
+          pool.length > 1
+        ) {
+          continue
+        }
+        const next = withRecipeAt(current, index, candidate, prefs.people)
+        if (!varietyOk(next, prefs, step)) continue
+        const cost = shoppingCost(next, prefs)
+        const share = mealShare(next, index, candidate)
+        if (cost + 0.01 >= currentCost) continue
+        if (
+          !best ||
+          cost < best.cost - 0.01 ||
+          (Math.abs(cost - best.cost) <= 0.01 && share > best.share)
+        ) {
+          best = { index, recipe: candidate, cost, share }
+        }
+      }
+    }
+    if (!best) break
+    current = withRecipeAt(current, best.index, best.recipe, prefs.people)
+  }
+
+  for (let pass = 0; pass < OPTIMIZE_PAIR_PASSES; pass += 1) {
+    if (counter.n > OPTIMIZE_EVAL_LIMIT) break
+    const currentCost = shoppingCost(current, prefs)
+    if (currentCost <= prefs.budget) break
+    const expensive = current
+      .map((meal, index) => ({ index, cost: recipeCost(getRecipe(meal.recipeId), prefs.people) }))
+      .sort((a, b) => b.cost - a.cost)
+      .slice(0, 6)
+      .map((item) => item.index)
+    let best: { first: number; second: number; a: Recipe; b: Recipe; cost: number; share: number } | null =
+      null
+    for (let left = 0; left < expensive.length; left += 1) {
+      for (let right = left + 1; right < expensive.length; right += 1) {
+        const first = expensive[left]
+        const second = expensive[right]
+        const firstPool = compatiblePool(prefs, current[first].slot)
+        const secondPool = compatiblePool(prefs, current[second].slot)
+        for (const candidateA of firstPool) {
+          if (candidateA.id === current[first].recipeId) continue
+          for (const candidateB of secondPool) {
+            if (candidateB.id === current[second].recipeId) continue
+            if (spendEval(counter)) return current
+            const next = withRecipeAt(
+              withRecipeAt(current, first, candidateA, prefs.people),
+              second,
+              candidateB,
+              prefs.people,
+            )
+            if (!varietyOk(next, prefs, step)) continue
+            const cost = shoppingCost(next, prefs)
+            if (cost + 0.01 >= currentCost) continue
+            const share = mealShare(next, first, candidateA) + mealShare(next, second, candidateB)
+            if (
+              !best ||
+              cost < best.cost - 0.01 ||
+              (Math.abs(cost - best.cost) <= 0.01 && share > best.share)
+            ) {
+              best = { first, second, a: candidateA, b: candidateB, cost, share }
+            }
+          }
+        }
+      }
+    }
+    if (!best) break
+    current = withRecipeAt(
+      withRecipeAt(current, best.first, best.a, prefs.people),
+      best.second,
+      best.b,
+      prefs.people,
+    )
+  }
+
+  return current
+}
+
+function searchCheaperWeek(start: PlannedMeal[], prefs: PlannerPrefs): PlannedMeal[] {
+  let bestMeals = start.map((meal) => ({ ...meal }))
+  let bestCost = shoppingCost(bestMeals, prefs)
+  if (bestCost <= prefs.budget) return bestMeals
+  const counter = { n: 0 }
+
+  for (const step of varietySteps(prefs, start.length)) {
+    if (counter.n > OPTIMIZE_EVAL_LIMIT) break
+    const starts = [bestMeals]
+    const seed = buildLowCostWeek(start, prefs, step, counter)
+    if (seed) starts.push(seed)
+    for (const candidate of starts) {
+      const climbed = improveBySwaps(candidate, prefs, step, counter)
+      if (!varietyOk(climbed, prefs, step)) continue
+      const cost = shoppingCost(climbed, prefs)
+      if (cost + 0.01 < bestCost) {
+        bestMeals = climbed
+        bestCost = cost
+      }
+      if (bestCost <= prefs.budget) return bestMeals
+    }
+  }
+
+  return bestMeals
+}
+
+function describeMealChanges(before: PlannedMeal[], after: PlannedMeal[], prefs: PlannerPrefs): PlanChange[] {
+  const changes: PlanChange[] = []
+  let running = before
+  for (let index = 0; index < after.length; index += 1) {
+    if (before[index]?.recipeId === after[index]?.recipeId) continue
+    const recipe = getRecipe(after[index].recipeId)
+    const next = withRecipeAt(running, index, recipe, prefs.people)
+    const saved = shoppingCost(running, prefs) - shoppingCost(next, prefs)
+    changes.push({
+      dayLabel: before[index].dayLabel,
+      slot: before[index].slot,
+      fromName: getRecipe(before[index].recipeId).name,
+      toName: recipe.name,
+      reason:
+        saved >= 0.5
+          ? `Cut about ${Math.round(saved)} from the weekly shop`
+          : 'Lower-cost meal that reuses ingredients and stays within your limits',
+    })
+    running = next
+  }
+  return changes
+}
+
 export function optimizePlan(plan: MealPlan): MealPlan {
   const prefs = { ...plan.prefs, budget: plan.prefs.budget }
   let meals = [...plan.meals]
   const changes: PlanChange[] = []
-  const possibleUnique = maxPossibleUnique(prefs)
-  const varietyFloor = Math.max(
-    Math.min(possibleUnique, meals.length),
-    Math.min(possibleUnique, Math.ceil(meals.length * 0.85)),
-  )
-
-  const applyBestCheaperSwap = (uniqueFloor: number, allowDouble: boolean): boolean => {
-    const currentCost = shoppingCost(meals, prefs)
-    const currentUnique = uniqueRecipeCount(meals)
-    const expensiveOrder = meals
-      .map((meal, index) => ({
-        index,
-        cost: recipeCost(getRecipe(meal.recipeId), prefs.people),
-      }))
-      .sort((a, b) => b.cost - a.cost)
-
-    let best: {
-      index: number
-      recipe: Recipe
-      cost: number
-      score: number
-      unique: number
-    } | null = null
-
-    for (const { index } of expensiveOrder) {
-      const pool = compatiblePool(prefs, meals[index].slot)
-      const days = slotDayCount(meals, meals[index].slot)
-      const cap = hardUseCap(pool.length, days)
-      for (const candidate of pool) {
-        if (candidate.id === meals[index].recipeId) continue
-        if (neighborId(meals, index, -1) === candidate.id) continue
-        if (neighborId(meals, index, 1) === candidate.id) continue
-        const uses = usageAfterSwap(meals, index, candidate.id)
-        if (uses > cap) continue
-        if (uses > 2 && pool.length >= 4) continue
-        if (!allowDouble && violatesHardVariety(meals, index, candidate.id, pool)) continue
-        const next = withRecipeAt(meals, index, candidate, prefs.people)
-        if (consecutiveRepeatCount(next) > 0) continue
-        const nextUnique = uniqueRecipeCount(next)
-        if (nextUnique < uniqueFloor) continue
-        if (nextUnique < currentUnique && currentCost <= prefs.budget + 5) continue
-        const nextCost = shoppingCost(next, prefs)
-        if (nextCost + 0.01 >= currentCost) continue
-        const pantryHits = recipeUsesPantry(candidate, prefs.pantry)
-        const share = weekOverlap(next, index, candidate)
-        const cookFit = candidate.cookMinutes <= prefs.cookMinutesMax ? 1 : 0
-        const overBy = currentCost - prefs.budget
-        const repeatPenalty = Math.max(0, uses - 1) * (overBy > 8 ? 3 : 14)
-        const score =
-          (currentCost - nextCost) * 6 +
-          pantryHits * 2.5 +
-          share * 2.2 +
-          nextUnique * 2.8 +
-          cookFit -
-          repeatPenalty
-        if (
-          !best ||
-          score > best.score + 0.01 ||
-          (Math.abs(score - best.score) <= 0.01 && nextUnique > best.unique) ||
-          (Math.abs(score - best.score) <= 0.01 && nextUnique === best.unique && nextCost < best.cost)
-        ) {
-          best = { index, recipe: candidate, cost: nextCost, score, unique: nextUnique }
-        }
-      }
-    }
-
-    if (!best) return false
-    const fromRecipe = getRecipe(meals[best.index].recipeId)
-    const current = meals[best.index]
-    meals = withRecipeAt(meals, best.index, best.recipe, prefs.people)
-    changes.push({
-      dayLabel: current.dayLabel,
-      slot: current.slot,
-      fromName: fromRecipe.name,
-      toName: best.recipe.name,
-      reason: `Cut about ${Math.round(currentCost - best.cost)} from the weekly shop`,
-    })
-    return true
-  }
 
   let cost = shoppingCost(meals, prefs)
   if (cost > prefs.budget + 0.05) {
-    const uniqueFloors = [varietyFloor, Math.min(possibleUnique, 19), Math.min(possibleUnique, 18)].filter(
-      (value, index, list) => value > 0 && list.indexOf(value) === index,
-    )
-    for (const uniqueFloor of uniqueFloors) {
-      for (let pass = 0; pass < 28; pass += 1) {
-        cost = shoppingCost(meals, prefs)
-        if (cost <= prefs.budget + 0.05) break
-        if (!applyBestCheaperSwap(uniqueFloor, false)) break
-      }
-      if (shoppingCost(meals, prefs) <= prefs.budget + 0.05) break
-    }
-    cost = shoppingCost(meals, prefs)
-    if (cost > prefs.budget + 0.05) {
-      for (const uniqueFloor of uniqueFloors) {
-        for (let pass = 0; pass < 16; pass += 1) {
-          cost = shoppingCost(meals, prefs)
-          if (cost <= prefs.budget + 5) break
-          if (!applyBestCheaperSwap(uniqueFloor, true)) break
-        }
-        if (shoppingCost(meals, prefs) <= prefs.budget + 5) break
-      }
+    const optimizedMeals = searchCheaperWeek(meals, prefs)
+    if (shoppingCost(optimizedMeals, prefs) + 0.01 < cost) {
+      changes.push(...describeMealChanges(meals, optimizedMeals, prefs))
+      meals = optimizedMeals
     }
   } else {
     const seen = new Set<string>()
@@ -1132,8 +1400,6 @@ export function optimizePlan(plan: MealPlan): MealPlan {
       if (changes.length >= 8) break
     }
   }
-
-  cost = shoppingCost(meals, prefs)
 
   const next = {
     ...plan,
