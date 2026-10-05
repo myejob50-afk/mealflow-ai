@@ -164,7 +164,7 @@ function DietStep() {
   return (
     <StepFrame
       title="Any dietary pattern we should follow?"
-      subtitle="The planner only uses recipes that match this diet from the demo catalog."
+      subtitle="The planner only uses recipes that match this diet."
       footer={
         <>
           <Button variant="ghost" onClick={goBack}>
@@ -384,7 +384,7 @@ function GenerateStep() {
   return (
     <StepFrame
       title="Ready to generate the week?"
-      subtitle="Nourivoo AI will assemble a 7-day plan from the demo catalog, then you can optimize cost and open the grocery list."
+      subtitle="Nourivoo AI will build a personalized 7-day meal plan based on your budget, household, dietary preferences, and pantry."
       footer={
         <>
           <Button variant="ghost" onClick={goBack} disabled={generating}>
